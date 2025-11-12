@@ -942,6 +942,29 @@ public:
     if (!ppRTView)
       return S_FALSE;
 
+    // Detect and handle attempts to create RTV from Buffer
+    D3D11_RESOURCE_DIMENSION dimension;
+    pResource->GetType(&dimension);
+    if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+      Com<ID3D11Buffer> buffer;
+      if (SUCCEEDED(pResource->QueryInterface(IID_PPV_ARGS(&buffer)))) {
+        static bool warned_once = false;
+        if (!warned_once) {
+          WARN("D3D11Device: CreateRenderTargetView from Buffer - returning dummy 1x1 RTV (further warnings suppressed)");
+          warned_once = true;
+        }
+        // Return a dummy 1x1 texture RTV filled with (0, 0, 0, 1) — prevents undefined behavior/crashes when rendering with null buffer
+        auto* dummy = GetOrCreateDummyRenderTargetView();
+        if (dummy) {
+          *ppRTView = dummy;
+          dummy->AddRef();
+          return S_OK;
+        }
+        // Fallback to S_FALSE if dummy creation failed
+        return S_FALSE;
+      }
+    }
+
     return static_cast<D3D11ResourceCommon *>(pResource)->CreateRenderTargetView(pDesc, ppRTView);
   }
 
@@ -1098,6 +1121,54 @@ public:
     return dxmt::CreateSwapChain(pFactory, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 
+  // Lazily creates a dummy 1x1 RGBA8 texture and RTV (returns cached dummy RTV, creating it on first call)
+  ID3D11RenderTargetView1* GetOrCreateDummyRenderTargetView() {
+    if (dummy_rtv_) {
+      return dummy_rtv_.ptr();
+    }
+    // Create a 1x1 RGBA8 texture filled with (0, 0, 0, 1)
+    D3D11_TEXTURE2D_DESC1 tex_desc = {};
+    tex_desc.Width = 1;
+    tex_desc.Height = 1;
+    tex_desc.MipLevels = 1;
+    tex_desc.ArraySize = 1;
+    tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    tex_desc.SampleDesc.Count = 1;
+    tex_desc.SampleDesc.Quality = 0;
+    tex_desc.Usage = D3D11_USAGE_DEFAULT;
+    tex_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    tex_desc.CPUAccessFlags = 0;
+    tex_desc.MiscFlags = 0;
+    tex_desc.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
+    uint32_t pixel_data = 0xFF000000;
+    D3D11_SUBRESOURCE_DATA init_data = {};
+    init_data.pSysMem = &pixel_data;
+    init_data.SysMemPitch = 4;
+    init_data.SysMemSlicePitch = 4;
+    // Create the texture
+    Com<ID3D11Texture2D1> dummy_texture;
+    HRESULT hr = CreateTexture2D1(&tex_desc, &init_data, &dummy_texture);
+    if (FAILED(hr)) {
+      ERR("Failed to create dummy texture");
+      return nullptr;
+    }
+    // Query for ID3D11Resource interface to pass to CreateRenderTargetView
+    Com<ID3D11Resource> resource;
+    hr = dummy_texture->QueryInterface(IID_PPV_ARGS(&resource));
+    if (FAILED(hr)) {
+      ERR("Failed to query resource interface for dummy texture");
+      return nullptr;
+    }
+    // Call CreateRenderTargetView through normal path — since resource is a texture (not a buffer) it won't trigger infinite recursion
+    hr = CreateRenderTargetView1(resource.ptr(), nullptr, &dummy_rtv_);
+    if (FAILED(hr)) {
+      ERR("Failed to create dummy RTV");
+      return nullptr;
+    }
+    WARN("Created dummy 1x1 texture and RTV");
+    return dummy_rtv_.ptr();
+  }
+
 private:
   MTLDXGIObject<IMTLDXGIDevice> *container_;
   D3D_FEATURE_LEVEL feature_level_;
@@ -1119,6 +1190,8 @@ private:
   std::unique_ptr<MTLD3D11DeviceContextBase> context_;
   std::unique_ptr<MTLD3D10Device> d3d10_;
   D3D11Multithread d3dmt_;
+
+  Com<ID3D11RenderTargetView1> dummy_rtv_;
 };
 
 /**
