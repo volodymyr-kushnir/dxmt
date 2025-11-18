@@ -19,6 +19,7 @@
 #include "dxmt_command_queue.hpp"
 #include "dxmt_device.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_names.hpp"
 #include "ftl.hpp"
 #include "d3d11_resource.hpp"
 #include "dxgi_object.hpp"
@@ -942,22 +943,21 @@ public:
     if (!ppRTView)
       return S_FALSE;
 
-    // Detect and handle attempts to create RTV from Buffer
+    // Detect and handle attempts to create RTV from buffer
     D3D11_RESOURCE_DIMENSION dimension;
     pResource->GetType(&dimension);
     if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
       Com<ID3D11Buffer> buffer;
       if (SUCCEEDED(pResource->QueryInterface(IID_PPV_ARGS(&buffer)))) {
+        // Return a dummy texture RTV with correct format and size — prevents crashes or undefined behavior when rendering with null buffer
         static bool warned_once = false;
         if (!warned_once) {
-          WARN("D3D11Device: CreateRenderTargetView from Buffer - returning dummy 1x1 RTV (further warnings suppressed)");
+          WARN("D3D11Device: CreateRenderTargetView from buffer - returning dummy texture RTV with correct format/size (further warnings suppressed)");
           warned_once = true;
         }
-        // Return a dummy 1x1 texture RTV filled with (0, 0, 0, 1) — prevents undefined behavior/crashes when rendering with null buffer
-        auto* dummy = GetOrCreateDummyRenderTargetView();
+        auto* dummy = CreateDummyRenderTargetView(pDesc, buffer.ptr());
         if (dummy) {
           *ppRTView = dummy;
-          dummy->AddRef();
           return S_OK;
         }
         // Fallback to S_FALSE if dummy creation failed
@@ -1121,18 +1121,56 @@ public:
     return dxmt::CreateSwapChain(pFactory, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 
-  // Lazily creates a dummy 1x1 RGBA8 texture and RTV (returns cached dummy RTV, creating it on first call)
-  ID3D11RenderTargetView1* GetOrCreateDummyRenderTargetView() {
-    if (dummy_rtv_) {
-      return dummy_rtv_.ptr();
+  // Creates a dummy DX11 RTV backed by a Metal texture with correct format and size
+  ID3D11RenderTargetView1* CreateDummyRenderTargetView(const D3D11_RENDER_TARGET_VIEW_DESC1 *pDesc, ID3D11Buffer *buffer) {
+    // Use the format from pDesc if provided, otherwise default to RGBA8
+    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    UINT num_elements = 1;
+    if (pDesc) {
+      format = pDesc->Format;
+      if (pDesc->ViewDimension == D3D11_RTV_DIMENSION_BUFFER) {
+        num_elements = pDesc->Buffer.NumElements;
+      }
     }
-    // Create a 1x1 RGBA8 texture filled with (0, 0, 0, 1)
+    // Query format information to get bytes per element, fallback to 4 bytes
+    MTL_DXGI_FORMAT_DESC format_desc;
+    if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), format, format_desc))) {
+      ERR("Failed to query DXGI format for dummy texture");
+      return nullptr;
+    }
+    UINT bytes_per_element = format_desc.BytesPerTexel;
+    if (bytes_per_element == 0) {
+      bytes_per_element = 4;
+    }
+    // Get buffer description to determine size.
+    // Calculate texture dimensions based on buffer size and format.
+    // Use a reasonable 2D texture size (prefer square-ish dimensions)
+    D3D11_BUFFER_DESC buffer_desc;
+    buffer->GetDesc(&buffer_desc);
+    UINT total_bytes = buffer_desc.ByteWidth;
+    if (num_elements > 0 && num_elements * bytes_per_element <= total_bytes) {
+      total_bytes = num_elements * bytes_per_element;
+    }
+    UINT total_pixels = total_bytes / bytes_per_element;
+    if (total_pixels == 0) {
+      total_pixels = 1;
+    }
+    // Create a square-ish texture (or 1D if too small)
+    UINT width = static_cast<UINT>(std::sqrt(static_cast<float>(total_pixels)));
+    if (width == 0) width = 1;
+    UINT height = (total_pixels + width - 1) / width;
+    if (height == 0) height = 1;
+    // Limit dimensions to reasonable values
+    const UINT MAX_DIM = 16384;
+    if (width > MAX_DIM) width = MAX_DIM;
+    if (height > MAX_DIM) height = MAX_DIM;
+    // Create D3D11 texture descriptor
     D3D11_TEXTURE2D_DESC1 tex_desc = {};
-    tex_desc.Width = 1;
-    tex_desc.Height = 1;
+    tex_desc.Width = width;
+    tex_desc.Height = height;
     tex_desc.MipLevels = 1;
     tex_desc.ArraySize = 1;
-    tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    tex_desc.Format = format;
     tex_desc.SampleDesc.Count = 1;
     tex_desc.SampleDesc.Quality = 0;
     tex_desc.Usage = D3D11_USAGE_DEFAULT;
@@ -1140,33 +1178,37 @@ public:
     tex_desc.CPUAccessFlags = 0;
     tex_desc.MiscFlags = 0;
     tex_desc.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
-    uint32_t pixel_data = 0xFF000000;
-    D3D11_SUBRESOURCE_DATA init_data = {};
-    init_data.pSysMem = &pixel_data;
-    init_data.SysMemPitch = 4;
-    init_data.SysMemSlicePitch = 4;
-    // Create the texture
-    Com<ID3D11Texture2D1> dummy_texture;
-    HRESULT hr = CreateTexture2D1(&tex_desc, &init_data, &dummy_texture);
+    // Create D3D11 texture (backed by Metal texture with correct format/size)
+    Com<ID3D11Texture2D1> dummy_tex;
+    HRESULT hr = CreateTexture2D1(&tex_desc, nullptr, &dummy_tex);
     if (FAILED(hr)) {
       ERR("Failed to create dummy texture");
       return nullptr;
     }
-    // Query for ID3D11Resource interface to pass to CreateRenderTargetView
+    // Query for ID3D11Resource interface
     Com<ID3D11Resource> resource;
-    hr = dummy_texture->QueryInterface(IID_PPV_ARGS(&resource));
+    hr = dummy_tex->QueryInterface(IID_PPV_ARGS(&resource));
     if (FAILED(hr)) {
-      ERR("Failed to query resource interface for dummy texture");
+      ERR("Failed to query interface for dummy texture");
       return nullptr;
     }
-    // Call CreateRenderTargetView through normal path — since resource is a texture (not a buffer) it won't trigger infinite recursion
-    hr = CreateRenderTargetView1(resource.ptr(), nullptr, &dummy_rtv_);
+    // Create RTV descriptor (with the same format)
+    D3D11_RENDER_TARGET_VIEW_DESC1 rtv_desc = {};
+    rtv_desc.Format = format;
+    rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    rtv_desc.Texture2D.MipSlice = 0;
+    rtv_desc.Texture2D.PlaneSlice = 0;
+    // Create RTV. Call CreateRenderTargetView through normal path — since resource is a texture (not a buffer) it won't trigger infinite recursion
+    Com<ID3D11RenderTargetView1> dummy_rtv;
+    hr = CreateRenderTargetView1(resource.ptr(), &rtv_desc, &dummy_rtv);
     if (FAILED(hr)) {
       ERR("Failed to create dummy RTV");
       return nullptr;
     }
-    WARN("Created dummy 1x1 texture and RTV");
-    return dummy_rtv_.ptr();
+    std::ostringstream format_name;
+    format_name << format;
+    WARN("Created dummy RTV with Metal texture — ", width, "×", height, ", ", static_cast<UINT>(format), " (", format_name.str(), ")");
+    return dummy_rtv.ref();
   }
 
 private:
@@ -1190,8 +1232,6 @@ private:
   std::unique_ptr<MTLD3D11DeviceContextBase> context_;
   std::unique_ptr<MTLD3D10Device> d3d10_;
   D3D11Multithread d3dmt_;
-
-  Com<ID3D11RenderTargetView1> dummy_rtv_;
 };
 
 /**
