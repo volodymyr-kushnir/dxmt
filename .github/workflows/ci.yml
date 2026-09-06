@@ -4,11 +4,13 @@ on:
   push:
     branches:
     - main
+    - release
     tags:
-    - 'v*'
+    - 'v*-g*'
   pull_request:
     branches:
     - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -298,6 +300,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: true
+          fetch-depth: 0
 
       - name: Restore Wine Cache
         uses: actions/cache/restore@v5
@@ -342,6 +345,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: true
+          fetch-depth: 0
 
       - name: Restore Wine Cache
         uses: actions/cache/restore@v5
@@ -380,6 +384,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: true
+          fetch-depth: 0
 
       - name: Restore Wine Cache
         uses: actions/cache/restore@v5
@@ -432,6 +437,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: true
+          fetch-depth: 0
 
       - name: Restore Wine Cache
         uses: actions/cache/restore@v5
@@ -478,6 +484,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: true
+          fetch-depth: 0
 
       - name: Restore Wine Cache
         uses: actions/cache/restore@v5
@@ -518,6 +525,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: true
+          fetch-depth: 0
 
       - name: Restore Wine Cache (ARM64EC)
         uses: actions/cache/restore@v5
@@ -564,6 +572,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: true
+          fetch-depth: 0
 
       - name: Restore Wine Cache (ARM64EC)
         uses: actions/cache/restore@v5
@@ -610,6 +619,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: true
+          fetch-depth: 0
 
       - name: Restore LLVM Darwin Native Cache
         uses: actions/cache/restore@v5
@@ -635,41 +645,198 @@ jobs:
           name: clang-release-arm64-macos
           path: install
 
+  build-gcc-release-x86_64-windows-cross-nativedll:
+    runs-on: macos-15
+    needs: [setup-wine, setup-llvm-darwin]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Restore Wine Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+
+      - name: Install mingw-w64
+        uses: tecolicom/actions-use-homebrew-tools@v1
+        with:
+          tools: mingw-w64
+
+      - name: Restore LLVM Darwin Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+
+      - name: Select Xcode Version
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+
+      - name: Install Meson
+        run: pip3 install meson==1.10.0 --break-system-packages
+
+      - name: Build
+        run: |
+          meson setup --cross-file build-win64.txt -Dwine_builtin_dll=false -Denable_nvapi=true -Denable_nvngx=true -Dnative_llvm_path=toolchains/llvm-darwin -Dwine_install_path=toolchains/wine build --buildtype release --prefix $(pwd)/install --strip
+          meson compile -C build
+          meson install -C build
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: gcc-release-x86_64-windows-cross-nativedll
+          path: install
+
+  build-gcc-release-x86-windows-cross-nativedll:
+    runs-on: macos-15
+    needs: [setup-wine]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Restore Wine Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+
+      - name: Install mingw-w64
+        uses: tecolicom/actions-use-homebrew-tools@v1
+        with:
+          tools: mingw-w64
+
+      - name: Select Xcode Version
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+
+      - name: Install Meson
+        run: pip3 install meson==1.10.0 --break-system-packages
+
+      - name: Build WoW64
+        run: |
+          meson setup --cross-file build-win32.txt -Dwine_builtin_dll=false -Dwine_install_path=toolchains/wine build --buildtype release --prefix $(pwd)/install --strip
+          meson compile -C build
+          meson install -C build
+
+      - name: Upload WoW64
+        uses: actions/upload-artifact@v6
+        with:
+          name: gcc-release-x86-windows-cross-nativedll
+          path: install
+
   package:
     runs-on: macos-15
-    needs: [build-gcc-release-x86_64-windows-cross, build-gcc-release-x86-windows-cross, build-clang-release-arm64ec-windows-cross]
-    env:
-      PACKAGE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.sha }}
+    needs:
+      - build-gcc-release-x86_64-windows-cross
+      - build-gcc-release-x86-windows-cross
+      - build-clang-release-arm64ec-windows-cross
+      - build-gcc-release-x86_64-windows-cross-nativedll
+      - build-gcc-release-x86-windows-cross-nativedll
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
-      - name: Download Win64 Artifact
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: v
+        run: echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
         uses: actions/download-artifact@v8
         with:
-          name: gcc-release-x86_64-windows-cross
-          path: ./combined/${{ env.PACKAGE_TAG }}
+          path: ./artifacts
 
-      - name: Download Win32 Artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: gcc-release-x86-windows-cross
-          path: ./combined/${{ env.PACKAGE_TAG }}
+      - name: Assemble zips
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          ROOT=$(pwd)
+          mkdir -p dist
 
-      - name: Download ARM64EC Artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: clang-release-arm64ec-windows-cross
-          path: ./combined/${{ env.PACKAGE_TAG }}
+          zip_up() {
+            name=$1; shift
+            stage="stage/$name"
+            mkdir -p "$stage"
+            for src in "$@"; do cp -R "artifacts/$src/." "$stage/"; done
+            cp LICENSE COPYING.LIB "$stage/"
+            find "$stage" -name '*.a' -delete
+            ( cd "$stage" && zip -qr "$ROOT/dist/dxmt-${VERSION}-${name}.zip" . )
+            echo "  dist/dxmt-${VERSION}-${name}.zip"
+            ( cd "$stage" && find . -type f | sed 's|^\./|    |' | sort )
+          }
 
-      - name: Create Tarball
-        run: tar -czf dxmt-${{ env.PACKAGE_TAG }}.tar.gz -C ./combined --exclude='*.a' ${{ env.PACKAGE_TAG }}
+          zip_up wine-builtin \
+            gcc-release-x86_64-windows-cross \
+            gcc-release-x86-windows-cross \
+            clang-release-arm64ec-windows-cross
+
+          zip_up wine-native \
+            gcc-release-x86_64-windows-cross-nativedll \
+            gcc-release-x86-windows-cross-nativedll
 
       - name: Generate Artifact Attestation
         uses: actions/attest-build-provenance@v1
         if: startsWith(github.ref, 'refs/tags/v')
         with:
-          subject-path: dxmt-${{ env.PACKAGE_TAG }}.tar.gz
+          subject-path: dist/*.zip
 
       - name: Upload Combined Artifact
         uses: actions/upload-artifact@v6
         with:
-          name: dxmt-${{ env.PACKAGE_TAG }}
-          path: dxmt-${{ env.PACKAGE_TAG }}.tar.gz
+          name: dxmt-${{ steps.v.outputs.version }}
+          path: dist
+
+  release:
+    runs-on: ubuntu-latest
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download packaged zips
+        uses: actions/download-artifact@v8
+        with:
+          name: dxmt-${{ needs.package.outputs.version }}
+          path: dist
+
+      - name: Compose release notes
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/3Shain/dxmt.git
+          git fetch --quiet upstream main
+          BASE=$(git merge-base HEAD upstream/main)
+          {
+            sed "s/@VERSION@/${VERSION}/g; s/@BASE@/$(git describe --tags "$BASE")/g" \
+              packaging/RELEASE_NOTES.md
+            echo
+            echo '## Commits on top of upstream'
+            echo
+            git log --reverse --pretty='- `%h` %s' "${BASE}..HEAD"
+            echo
+            echo "Upstream base: [\`$(git rev-parse --short "$BASE")\`](https://github.com/3Shain/dxmt/commit/$(git rev-parse "$BASE"))"
+          } > notes.md
+          cat notes.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.package.outputs.version }}
+          body_path: notes.md
+          files: dist/*.zip
+          draft: true
